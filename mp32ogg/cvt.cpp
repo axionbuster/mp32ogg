@@ -25,7 +25,59 @@ void destroyavcodec(AVCodecContext* p)
   avcodec_free_context(&p);
 }
 
+void destroypkt(AVPacket* p)
+{
+  av_packet_free(&p);
+}
+
+void destroyfr(AVFrame* p)
+{
+  av_frame_free(&p);
+}
+
+// relay packet -> frame
+//
+// return true if we need to break early but there's no error
+static bool relaypkts(AVFormatContext* ofctx, AVStream* ostr, AVCodecContext* oencctx, int& err)
+{
+  for (;;)
+  {
+    auto const opkt_{ av_packet_alloc() };
+    if (!opkt_)
+    {
+      err = -26;
+      return false;
+    }
+    fuptr<AVPacket, destroypkt> opkt{ opkt_ };
+
+    if (auto const i{ avcodec_receive_packet(&*oencctx, &*opkt) }; i < 0)
+      switch (i)
+      {
+      case AVERROR(EAGAIN): case AVERROR_EOF:
+        return true;
+      default:
+      {
+        err = -24;
+        return false;
+      }
+      }
+
+    // set stream index for output packet
+    opkt->stream_index = ostr->index;
+
+    // write packet to output file
+    if (auto const i{ av_write_frame(&*ofctx, &*opkt) }; i < 0)
+    {
+      err = -25;
+      return false;
+    }
+
+    av_packet_unref(&*opkt);
+  }
+}
+
 extern "C" {
+  // convert the mp3 file at inpath to the ogg file at outpath
   int cvtmp3toogg(char const* inpath, char const* outpath)
   {
     // open input file (mp3)
@@ -37,7 +89,7 @@ extern "C" {
       return -2;
 
     // find audio stream
-    const auto UMAX = std::numeric_limits<unsigned>::max();
+    auto const UMAX = std::numeric_limits<unsigned>::max();
     unsigned iaudiostr{ UMAX };
     for (unsigned i{}; i < ifctx->nb_streams; i++)
       if (ifctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
@@ -88,8 +140,6 @@ extern "C" {
     // copy settings & then open encoder
     // and then write header
     oencctx->sample_rate = idecctx->sample_rate;
-    oencctx->channel_layout = idecctx->channel_layout; // FIXME: deprecated
-    oencctx->channels = av_get_channel_layout_nb_channels(oencctx->channel_layout); // FIXME: deprecated
     oencctx->sample_fmt = AV_SAMPLE_FMT_FLTP; // important for Vorbis
     oencctx->bit_rate = idecctx->bit_rate;
     oencctx->time_base = { .num = 1, .den = oencctx->sample_rate };
@@ -102,7 +152,76 @@ extern "C" {
         return -14;
     avformat_write_header(&*ofctx, {});
 
-    // TODO: decode and reencode
+    // decode and encode
+    auto infr_{ av_frame_alloc() };
+    if (!infr_) return -18;
+    fuptr<AVFrame, destroyfr> infr{ infr_ };
+    auto oufr_{ av_frame_alloc() };
+    if (!oufr_) return -19;
+    fuptr<AVFrame, destroyfr> oufr{ oufr_ };
+
+    // enter main loop
+    for (;;) {
+      // allocate a new packet
+      auto const packet_{ av_packet_alloc() };
+      if (!packet_)
+        return -17;
+      fuptr<AVPacket, destroypkt> packet{ packet_ };
+
+      // read a frame into the packet
+      if (auto const i{ av_read_frame(&*ifctx, &*packet) }; i < 0) {
+        if (i == AVERROR_EOF)
+          break;
+        return -20;
+      }
+
+      // decode audio frame
+      if (static_cast<unsigned>(packet->stream_index) != iaudiostr)
+        continue;
+      if (auto const i{ avcodec_send_packet(&*idecctx, &*packet) }; i < 0 && i != AVERROR(EAGAIN))
+        return -21;
+
+      // write
+      for (;;)
+      {
+        // receive audio frame
+        if (auto const i{ avcodec_receive_frame(&*idecctx, &*infr) }; i < 0)
+          switch (i) {
+          case AVERROR(EAGAIN): case AVERROR_EOF:
+            // no frame available yet
+            goto breakfor;
+          default: return -22;
+          }
+
+        // TODO: resample as necessary
+
+        // set timestamps for output frame
+        auto istr{ ifctx->streams[iaudiostr] };
+        oufr->pts = av_rescale_q(infr->pts, istr->time_base, ostr->time_base);
+
+        // encode and write frame to output
+        if (auto const i{ avcodec_send_frame(&*oencctx, &*oufr) }; i < 0 && i != AVERROR(EAGAIN))
+          return -23;
+
+        int err;
+        if (relaypkts(&*ofctx, ostr, &*oencctx, err))
+          continue;
+        return err;
+      }
+
+    breakfor: {}
+    }
+
+    // flush encoders
+    if (auto const i{ avcodec_send_frame(&*oencctx, {}) }; i < 0 && i != AVERROR_EOF)
+      return -27;
+    for (;;)
+    {
+      int err;
+      if (relaypkts(&*ofctx, ostr, &*oencctx, err))
+        break;
+      return err - 4; // -28, -29, -30
+    }
 
     // write trailer; clean up
     if (av_write_trailer(&*ofctx) < 0)
