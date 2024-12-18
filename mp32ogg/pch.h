@@ -10,4 +10,10 @@
 // add headers that you want to pre-compile here
 #include "framework.h"
 
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libswresample/swresample.h>
+#include <limits>
+#include <memory>
+
 #endif //PCH_H
