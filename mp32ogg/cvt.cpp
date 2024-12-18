@@ -219,7 +219,7 @@ extern "C" {
     {
       int err;
       if (relaypkts(&*ofctx, ostr, &*oencctx, err))
-        break;
+        continue;
       return err - 4; // -28, -29, -30
     }
 
